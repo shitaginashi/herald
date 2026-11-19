@@ -1,5 +1,7 @@
 # Herald
 
+Deliver the message. Let others worry about the audience.
+
 Herald is a content-agnostic distribution engine.
 
 It does not create content.
