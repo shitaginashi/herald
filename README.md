@@ -1,11 +1,22 @@
-# herald
+# Herald
 
 Herald is a content-agnostic distribution engine.
 
-Assets enter the system.
+It does not create content.
+It does not rank content.
+It does not optimize content.
 
-Eligible assets are dispatched through platform adapters.
+Herald accepts eligible assets and delivers them through
+platform-specific adapters.
 
-Herald does not create content, evaluate content, or optimize content.
+The core remains stable.
+Platforms remain replaceable.
 
-Herald delivers content.
+## Principles
+
+- Script as Law
+- Illegal States Should Be Unrepresentable
+- Fail and Bitch Loudly
+- Adapters Are Disposable
+- Content Is Ammunition
+- Distribution Is the Objective
