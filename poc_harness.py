@@ -148,7 +148,6 @@ def extract_brand_context(branding: dict[str, Any], branding_path: Path) -> dict
 def parse_run_arguments(arguments: dict[str, Any]) -> tuple[list[str], dict[str, int], dict[str, str], str, list[str], bool, bool]:
     if not isinstance(arguments, dict):
         raise ValueError("Each run's arguments must be a mapping")
-    # Atomic is mandatory; derivative tiers are opt-in. Omission means atomic-only.
     tiers = arguments.get("tiers", ["atomic"])
     if (not isinstance(tiers, list) or not tiers
             or any(not isinstance(tier, str) or tier not in ("atomic", "fancy") for tier in tiers)):
@@ -225,15 +224,13 @@ def _slot_content_chars(slots: list[dict[str, Any]]) -> int:
 def apply_quota_budget(body: str, body_slots: list[dict[str, Any]], footer: dict[str, Any],
                        tier: str, budget_limit: int, quota_policy: str,
                        ledger: dict[str, int], extra_content: list[str] | None = None) -> dict[str, Any]:
-    """Annotate item and cumulative run totals without pruning any content."""
+    """Record quota telemetry; downstream agent owns caps and any pruning."""
     if quota_policy != DEFAULT_QUOTA_POLICY:
         raise ValueError(f"Unsupported quota_policy: {quota_policy!r}")
     body_chars = len(body)
     slot_chars = _slot_content_chars(body_slots)
     footer_chars = len(footer["text"])
     extra_chars = sum(len(segment) for segment in (extra_content or []) if segment)
-    # Keywords/voice/other metadata are not counted unless rendered as a content
-    # brick. CTA, credits, sidecars and other included text belong in slots/extras.
     counted_chars = body_chars + slot_chars + footer_chars + extra_chars
     item_overage = max(0, counted_chars - budget_limit)
     ledger["posts_emitted_count"] = ledger.get("posts_emitted_count", 0) + 1
@@ -253,10 +250,9 @@ def apply_quota_budget(body: str, body_slots: list[dict[str, Any]], footer: dict
         "post_index": ledger["posts_emitted_count"],
         "posts_emitted_count": ledger["posts_emitted_count"],
         "cumulative_counted_chars": ledger["cumulative_counted_chars"],
-        # Cumulative overage is the running sum of each item's budget overage;
-        # no separate run/window cap is configured by this manifest yet.
         "cumulative_overage_chars": ledger["cumulative_overage_chars"],
-        "run_quota_exceeded": False,
+        "enforcement_owner": "downstream_agent",
+        "agent_directive": "Use quota and any configured caps to guide editing; harness records telemetry only and must not prune content.",
     }
 
 
@@ -272,12 +268,15 @@ def build_variants(clean: dict[str, Any], out_dir: Path, brand_ctx: dict[str, An
     source_slots = clean.get("body_slots", [])
     wenwu = clean.get("wenwu") if isinstance(clean.get("wenwu"), dict) else {}
     tool_ids = [row["id"] for row in taxonomy_rows if "id" in row]
-    footer = _footer(brand_ctx)  # Mandatory tags remain a distinct final footer brick.
+    footer = _footer(brand_ctx)
     results = []
     for tier in tiers:
         slots = _eligible_body_slots(source_slots, tier)
         route = routing.get(tier)
-        cta_text = brand_ctx.get(f"cta_{route}") if cta_enabled and route else None
+        # Context keys use cta_social/cta_youtube; manifest routes use
+        # social_media/youtube. Translate explicitly instead of synthesizing a key.
+        cta_key = {"social_media": "cta_social", "youtube": "cta_youtube"}.get(route)
+        cta_text = brand_ctx.get(cta_key) if cta_enabled and cta_key else None
         if cta_text:
             slots.append({"slot": "CTA", "value": str(cta_text), "tiers": [tier], "source": f"branding.calls_to_action.{route}"})
         media = clean.get("media") if isinstance(clean.get("media"), dict) else {}
@@ -376,8 +375,6 @@ def run_batch(plan: PrefetchPlan, kuma_root: Path, branding: dict[str, Any],
     for spec in plan.runs:
         parse_run_arguments(spec.arguments)
         staged = stage_run_precursor(spec, dry_run=dry_run)
-        # One independent in-memory ledger per manifest run; all tier variants
-        # and posts produced by that run advance the same cumulative counters.
         run_ledger: dict[str, int] = {}
         run_pass(staged, out_dir, depot_dir, branding, branding_path,
                  taxonomy_rows, spec.arguments, dry_run, run_ledger)
