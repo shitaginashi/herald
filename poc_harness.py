@@ -17,6 +17,8 @@ PREFETCH_MANIFEST = "prefetch_manifest.yml"
 KUMA_ROOT = Path("/media/ran/mu/kuma")
 DEFAULT_BRANDING_PATH = Path("/media/ran/mu/notebook_runtime/src/notebooks/000/branding.yml")
 DEFAULT_TAXONOMY_DB_PATH = KUMA_ROOT / "data" / "taxonomy.db"
+DEFAULT_TIER_BUDGETS = {"atomic": 280, "fancy": 1000}
+DEFAULT_QUOTA_POLICY = "populate_annotate_export_log_only"
 
 
 class PromoteFSM:
@@ -141,17 +143,21 @@ def extract_brand_context(branding: dict[str, Any], branding_path: Path) -> dict
 def parse_run_arguments(arguments: dict[str, Any]) -> tuple[list[str], dict[str, int], dict[str, str], str, list[str], bool, bool]:
     if not isinstance(arguments, dict):
         raise ValueError("Each run's arguments must be a mapping")
-    tiers = arguments.get("tiers")
+    # Atomic is the required baseline. Derivative tiers are opt-in. An omitted
+    # tiers field therefore means the valid atomic-only run.
+    tiers = arguments.get("tiers", ["atomic"])
     if (not isinstance(tiers, list) or not tiers
             or any(not isinstance(tier, str) or tier not in ("atomic", "fancy") for tier in tiers)):
-        raise ValueError("Each run must provide tiers as a non-empty list of 'atomic'/'fancy'")
+        raise ValueError("tiers must be a non-empty list containing 'atomic' and optional 'fancy'")
+    if "atomic" not in tiers:
+        raise ValueError("atomic tier is mandatory; derivative tiers cannot run alone")
     if len(set(tiers)) != len(tiers):
         raise ValueError("tiers must not contain duplicates")
     budgets: dict[str, int] = {}
     for tier in tiers:
-        value = arguments.get(f"{tier}_budget")
+        value = arguments.get(f"{tier}_budget", DEFAULT_TIER_BUDGETS[tier])
         if not isinstance(value, int) or isinstance(value, bool) or value < 0:
-            raise ValueError(f"Run must provide a non-negative integer {tier}_budget")
+            raise ValueError(f"{tier}_budget must be a non-negative integer")
         budgets[tier] = value
     routing = arguments.get("cta_routing", {})
     if not isinstance(routing, dict):
@@ -162,8 +168,8 @@ def parse_run_arguments(arguments: dict[str, Any]) -> tuple[list[str], dict[str,
     cta_enabled = arguments.get("cta_enabled", False)
     if not isinstance(cta_enabled, bool):
         raise ValueError("cta_enabled must be a boolean")
-    policy = arguments.get("quota_policy")
-    if policy != "populate_annotate_export_log_only":
+    policy = arguments.get("quota_policy", DEFAULT_QUOTA_POLICY)
+    if policy != DEFAULT_QUOTA_POLICY:
         raise ValueError(f"Unsupported quota_policy: {policy!r}")
     precedence = arguments.get("precedence", [])
     if not isinstance(precedence, list) or any(not isinstance(item, str) for item in precedence):
@@ -171,8 +177,7 @@ def parse_run_arguments(arguments: dict[str, Any]) -> tuple[list[str], dict[str,
     archive = arguments.get("archive_to_depot", False)
     if not isinstance(archive, bool):
         raise ValueError("archive_to_depot must be a boolean")
-    # Unknown arguments are intentionally retained/forwarded for Kuma-owned
-    # extensions; this launcher only interprets the options it needs.
+    # Other Kuma-owned options remain legal and are passed through in output.
     return tiers, budgets, routing, policy, precedence, archive, cta_enabled
 
 
@@ -203,14 +208,11 @@ def _eligible_body_slots(source_slots: Any, tier: str) -> list[dict[str, Any]]:
 
 def apply_quota_budget(body: str, body_slots: list[dict[str, Any]], footer: dict[str, Any],
                        tier: str, budget_limit: int, quota_policy: str) -> dict[str, Any]:
-    if quota_policy != "populate_annotate_export_log_only":
+    if quota_policy != DEFAULT_QUOTA_POLICY:
         raise ValueError(f"Unsupported quota_policy: {quota_policy!r}")
     body_chars = len(body)
     slot_chars = sum(len(str(slot.get("value", ""))) for slot in body_slots)
-    footer_text = footer["text"]
-    footer_chars = len(footer_text)
-    # Telemetry estimates the assembled caption while keeping the source body,
-    # editable content bricks, and mandatory footer as separate output fields.
+    footer_chars = len(footer["text"])
     projected = body_chars + slot_chars + footer_chars
     errata = []
     if projected > budget_limit:
@@ -235,7 +237,7 @@ def build_variants(clean: dict[str, Any], out_dir: Path, brand_ctx: dict[str, An
     source_slots = clean.get("body_slots", [])
     wenwu = clean.get("wenwu") if isinstance(clean.get("wenwu"), dict) else {}
     tool_ids = [row["id"] for row in taxonomy_rows if "id" in row]
-    footer = _footer(brand_ctx)  # Tags are mandatory and always present as a footer brick.
+    footer = _footer(brand_ctx)  # Mandatory tags remain a distinct final footer brick.
     results = []
     for tier in tiers:
         slots = _eligible_body_slots(source_slots, tier)
