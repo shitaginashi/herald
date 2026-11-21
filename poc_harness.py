@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import os
 import shutil
 import sqlite3
 import tempfile
@@ -115,8 +116,12 @@ def extract_brand_context(branding: dict[str, Any], branding_path: Path) -> dict
     if not isinstance(voice, dict):
         voice = branding.get("voice_attributes") if isinstance(branding.get("voice_attributes"), dict) else {}
     seo = branding.get("seo_and_platform_guidelines") if isinstance(branding.get("seo_and_platform_guidelines"), dict) else {}
-    hashtags = seo.get("hashtags") if isinstance(seo.get("hashtags"), dict) else {}
-    ctas = seo.get("calls_to_action") if isinstance(seo.get("calls_to_action"), dict) else {}
+    hashtags = seo.get("hashtags")
+    if not isinstance(hashtags, dict):
+        hashtags = branding.get("hashtags") if isinstance(branding.get("hashtags"), dict) else {}
+    ctas = seo.get("calls_to_action")
+    if not isinstance(ctas, dict):
+        ctas = branding.get("calls_to_action") if isinstance(branding.get("calls_to_action"), dict) else {}
     tech = branding.get("technical_specifications") if isinstance(branding.get("technical_specifications"), dict) else {}
     return {
         "name": branding.get("brand_name") or identity.get("name") or branding.get("name") or "Darker Side of Passion",
@@ -143,8 +148,7 @@ def extract_brand_context(branding: dict[str, Any], branding_path: Path) -> dict
 def parse_run_arguments(arguments: dict[str, Any]) -> tuple[list[str], dict[str, int], dict[str, str], str, list[str], bool, bool]:
     if not isinstance(arguments, dict):
         raise ValueError("Each run's arguments must be a mapping")
-    # Atomic is the required baseline. Derivative tiers are opt-in. An omitted
-    # tiers field therefore means the valid atomic-only run.
+    # Atomic is mandatory; derivative tiers are opt-in. Omission means atomic-only.
     tiers = arguments.get("tiers", ["atomic"])
     if (not isinstance(tiers, list) or not tiers
             or any(not isinstance(tier, str) or tier not in ("atomic", "fancy") for tier in tiers)):
@@ -177,7 +181,6 @@ def parse_run_arguments(arguments: dict[str, Any]) -> tuple[list[str], dict[str,
     archive = arguments.get("archive_to_depot", False)
     if not isinstance(archive, bool):
         raise ValueError("archive_to_depot must be a boolean")
-    # Other Kuma-owned options remain legal and are passed through in output.
     return tiers, budgets, routing, policy, precedence, archive, cta_enabled
 
 
@@ -311,7 +314,7 @@ def run_pass(precursor_path: Path, out_dir: Path, depot_dir: Path, branding: dic
         try:
             for path, payload in variants:
                 fd, temp_name = tempfile.mkstemp(prefix=f".{path.name}.", suffix=".tmp", dir=out_dir)
-                with open(fd, "w", encoding="utf-8", closefd=True) as handle:
+                with os.fdopen(fd, "w", encoding="utf-8") as handle:
                     json.dump(payload, handle, indent=2)
                     handle.write("\n")
                 temp_files.append((Path(temp_name), path))

@@ -17,29 +17,11 @@ runs:
     precursor: "precursor_yuggoth.yml"
     source_dir: "bank"
     arguments:
-      tiers: ["atomic", "fancy"]
+      tiers: ["atomic"]
       atomic_budget: 280
-      fancy_budget: 1000
       cta_enabled: true
       cta_routing:
         atomic: "social_media"
-        fancy: "youtube"
-      quota_policy: "populate_annotate_export_log_only"
-      precedence: ["edit", "fsr", "wenwu", "mianzi"]
-      archive_to_depot: true
-
-  - name: "this_town_magazine_stress"
-    enabled: true
-    precursor: "precursor_town.yml"
-    source_dir: "bank"
-    arguments:
-      tiers: ["atomic", "fancy"]
-      atomic_budget: 280
-      fancy_budget: 1000
-      cta_enabled: true
-      cta_routing:
-        atomic: "social_media"
-        fancy: "youtube"
       quota_policy: "populate_annotate_export_log_only"
       precedence: ["edit", "fsr", "wenwu", "mianzi"]
       archive_to_depot: true
