@@ -209,30 +209,62 @@ def _eligible_body_slots(source_slots: Any, tier: str) -> list[dict[str, Any]]:
     return selected
 
 
+def _slot_content_chars(slots: list[dict[str, Any]]) -> int:
+    """Count content-bearing text/credit/link fields in eligible bricks."""
+    count = 0
+    for slot in slots:
+        for key in ("value", "text", "credit", "url"):
+            value = slot.get(key)
+            if isinstance(value, str):
+                count += len(value)
+            elif isinstance(value, list):
+                count += sum(len(str(item)) for item in value if item is not None)
+    return count
+
+
 def apply_quota_budget(body: str, body_slots: list[dict[str, Any]], footer: dict[str, Any],
-                       tier: str, budget_limit: int, quota_policy: str) -> dict[str, Any]:
+                       tier: str, budget_limit: int, quota_policy: str,
+                       ledger: dict[str, int], extra_content: list[str] | None = None) -> dict[str, Any]:
+    """Annotate item and cumulative run totals without pruning any content."""
     if quota_policy != DEFAULT_QUOTA_POLICY:
         raise ValueError(f"Unsupported quota_policy: {quota_policy!r}")
     body_chars = len(body)
-    slot_chars = sum(len(str(slot.get("value", ""))) for slot in body_slots)
+    slot_chars = _slot_content_chars(body_slots)
     footer_chars = len(footer["text"])
-    projected = body_chars + slot_chars + footer_chars
+    extra_chars = sum(len(segment) for segment in (extra_content or []) if segment)
+    # Keywords/voice/other metadata are not counted unless rendered as a content
+    # brick. CTA, credits, sidecars and other included text belong in slots/extras.
+    counted_chars = body_chars + slot_chars + footer_chars + extra_chars
+    item_overage = max(0, counted_chars - budget_limit)
+    ledger["posts_emitted_count"] = ledger.get("posts_emitted_count", 0) + 1
+    ledger["cumulative_counted_chars"] = ledger.get("cumulative_counted_chars", 0) + counted_chars
+    ledger["cumulative_overage_chars"] = ledger.get("cumulative_overage_chars", 0) + item_overage
     errata = []
-    if projected > budget_limit:
-        errata.extend(["ERR_BODY_EXCEEDS_BUDGET", "ERR_QUOTA_EXCEEDED_LOGGED"])
+    if counted_chars > budget_limit:
+        errata.extend(["ERR_ITEM_BUDGET_EXCEEDED", "ERR_ITEM_QUOTA_EXCEEDED_LOGGED"])
     return {
         "policy": quota_policy, "budget_limit": budget_limit, "body_chars": body_chars,
         "body_slot_chars": slot_chars, "footer_chars": footer_chars,
-        "projected_total_chars": projected,
-        "remaining_headroom": budget_limit - projected, "exceeded": projected > budget_limit,
-        "overage_chars": max(0, projected - budget_limit), "pruned": [], "errata": errata,
+        "extra_content_chars": extra_chars, "counted_chars": counted_chars,
+        "projected_total_chars": counted_chars,
+        "remaining_headroom": budget_limit - counted_chars,
+        "exceeded": counted_chars > budget_limit, "overage_chars": item_overage,
+        "pruned": [], "errata": errata,
+        "post_index": ledger["posts_emitted_count"],
+        "posts_emitted_count": ledger["posts_emitted_count"],
+        "cumulative_counted_chars": ledger["cumulative_counted_chars"],
+        # Cumulative overage is the running sum of each item's budget overage;
+        # no separate run/window cap is configured by this manifest yet.
+        "cumulative_overage_chars": ledger["cumulative_overage_chars"],
+        "run_quota_exceeded": False,
     }
 
 
 def build_variants(clean: dict[str, Any], out_dir: Path, brand_ctx: dict[str, Any],
                    taxonomy_rows: list[dict[str, Any]], arguments: dict[str, Any],
-                   branding_path: Path) -> list[tuple[Path, dict[str, Any]]]:
+                   branding_path: Path, ledger: dict[str, int] | None = None) -> list[tuple[Path, dict[str, Any]]]:
     tiers, budgets, routing, policy, precedence, _, cta_enabled = parse_run_arguments(arguments)
+    ledger = ledger if ledger is not None else {}
     base_id, motif, target = clean.get("id", "item"), clean.get("motif", "unknown"), clean.get("target", "base")
     body = clean.get("body", "")
     if not isinstance(body, str):
@@ -248,7 +280,13 @@ def build_variants(clean: dict[str, Any], out_dir: Path, brand_ctx: dict[str, An
         cta_text = brand_ctx.get(f"cta_{route}") if cta_enabled and route else None
         if cta_text:
             slots.append({"slot": "CTA", "value": str(cta_text), "tiers": [tier], "source": f"branding.calls_to_action.{route}"})
-        quota = apply_quota_budget(body, slots, footer, tier, budgets[tier], policy)
+        media = clean.get("media") if isinstance(clean.get("media"), dict) else {}
+        media_payload = ({"image": None, "video": None, "alt_text": None} if tier == "atomic" else
+                         {"image": None, "video": media.get("video"), "alt_text": media.get("alt_text")})
+        link = None if tier == "atomic" else clean.get("link") or f"https://{brand_ctx['domain']}"
+        extras = [str(value) for value in (media_payload.get("video"), media_payload.get("alt_text"), link)
+                  if isinstance(value, str) and value]
+        quota = apply_quota_budget(body, slots, footer, tier, budgets[tier], policy, ledger, extras)
         payload: dict[str, Any] = {
             "id": f"{base_id}_{tier}", "surface": clean.get("base", "reddit"), "stage": "reddit.json",
             "motif": motif, "target": target, "tier": tier, "body": body,
@@ -268,21 +306,15 @@ def build_variants(clean: dict[str, Any], out_dir: Path, brand_ctx: dict[str, An
                     "illustrated_tier_status": "deferred_pending_fsr" if tier == "fancy" else "not_applicable",
                     "legacy_milestone": clean.get("legacy_milestone"),
                     "harness_pass": ["read", "brick", "strip", "post"]},
+            "media": media_payload, "link": link,
         }
-        if tier == "atomic":
-            payload["media"] = {"image": None, "video": None, "alt_text": None}
-            payload["link"] = None
-        else:
-            media = clean.get("media") if isinstance(clean.get("media"), dict) else {}
-            payload["media"] = {"image": None, "video": media.get("video"), "alt_text": media.get("alt_text")}
-            payload["link"] = clean.get("link") or f"https://{brand_ctx['domain']}"
         results.append((out_dir / f"{motif}_{target}_{tier}.json", payload))
     return results
 
 
 def run_pass(precursor_path: Path, out_dir: Path, depot_dir: Path, branding: dict[str, Any],
              branding_path: Path, taxonomy_rows: list[dict[str, Any]], arguments: dict[str, Any],
-             dry_run: bool) -> list[Path]:
+             dry_run: bool, ledger: dict[str, int] | None = None) -> list[Path]:
     _, _, _, _, _, archive, _ = parse_run_arguments(arguments)
     fsm = PromoteFSM()
     fsm.advance("init", "read")
@@ -298,7 +330,7 @@ def run_pass(precursor_path: Path, out_dir: Path, depot_dir: Path, branding: dic
     cleaned = strip_invisible_ink(bricks, set(raw_exceptions))
     fsm.advance("strip", "post")
     brand_ctx = extract_brand_context(branding, branding_path)
-    variants = build_variants(cleaned, out_dir, brand_ctx, taxonomy_rows, arguments, branding_path)
+    variants = build_variants(cleaned, out_dir, brand_ctx, taxonomy_rows, arguments, branding_path, ledger)
     depot_dst = depot_dir / precursor_path.name
     if archive and depot_dst.exists():
         raise FileExistsError(f"Refusing to overwrite archived precursor: {depot_dst}")
@@ -344,7 +376,11 @@ def run_batch(plan: PrefetchPlan, kuma_root: Path, branding: dict[str, Any],
     for spec in plan.runs:
         parse_run_arguments(spec.arguments)
         staged = stage_run_precursor(spec, dry_run=dry_run)
-        run_pass(staged, out_dir, depot_dir, branding, branding_path, taxonomy_rows, spec.arguments, dry_run)
+        # One independent in-memory ledger per manifest run; all tier variants
+        # and posts produced by that run advance the same cumulative counters.
+        run_ledger: dict[str, int] = {}
+        run_pass(staged, out_dir, depot_dir, branding, branding_path,
+                 taxonomy_rows, spec.arguments, dry_run, run_ledger)
 
 
 def main() -> None:
