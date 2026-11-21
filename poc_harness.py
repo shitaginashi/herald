@@ -258,8 +258,14 @@ def apply_quota_budget(body: str, body_slots: list[dict[str, Any]], footer: dict
 
 def build_variants(clean: dict[str, Any], out_dir: Path, brand_ctx: dict[str, Any],
                    taxonomy_rows: list[dict[str, Any]], arguments: dict[str, Any],
-                   branding_path: Path, ledger: dict[str, int] | None = None) -> list[tuple[Path, dict[str, Any]]]:
-    tiers, budgets, routing, policy, precedence, _, cta_enabled = parse_run_arguments(arguments)
+                   branding_path: Path, ledger: dict[str, int] | None = None,
+                   tiers: list[str] | tuple[str, ...] | None = None) -> list[tuple[Path, dict[str, Any]]]:
+    # The optional override lets callers pass the manifest's tier selection
+    # explicitly; omitted tiers continue to be read from run arguments.
+    run_arguments = dict(arguments)
+    if tiers is not None:
+        run_arguments["tiers"] = list(tiers)
+    tiers, budgets, routing, policy, precedence, _, cta_enabled = parse_run_arguments(run_arguments)
     ledger = ledger if ledger is not None else {}
     base_id, motif, target = clean.get("id", "item"), clean.get("motif", "unknown"), clean.get("target", "base")
     body = clean.get("body", "")
@@ -273,8 +279,6 @@ def build_variants(clean: dict[str, Any], out_dir: Path, brand_ctx: dict[str, An
     for tier in tiers:
         slots = _eligible_body_slots(source_slots, tier)
         route = routing.get(tier)
-        # Context keys use cta_social/cta_youtube; manifest routes use
-        # social_media/youtube. Translate explicitly instead of synthesizing a key.
         cta_key = {"social_media": "cta_social", "youtube": "cta_youtube"}.get(route)
         cta_text = brand_ctx.get(cta_key) if cta_enabled and cta_key else None
         if cta_text:
@@ -296,7 +300,7 @@ def build_variants(clean: dict[str, Any], out_dir: Path, brand_ctx: dict[str, An
                 "keywords": brand_ctx["keywords"], "cta_enabled": cta_enabled,
                 "cta_route": route, "cta": cta_text,
             },
-            "quota": quota, "run_arguments": arguments,
+            "quota": quota, "run_arguments": run_arguments,
             "taxonomy_ref": {"db_present": bool(taxonomy_rows), "tool_count": len(taxonomy_rows)},
             "precedence": {"configured_order": precedence, "wenwu_present": bool(wenwu),
                            "wenwu_enabled": bool(wenwu.get("enabled", False)), "mianzi_tool_ids": tool_ids},
@@ -313,7 +317,8 @@ def build_variants(clean: dict[str, Any], out_dir: Path, brand_ctx: dict[str, An
 
 def run_pass(precursor_path: Path, out_dir: Path, depot_dir: Path, branding: dict[str, Any],
              branding_path: Path, taxonomy_rows: list[dict[str, Any]], arguments: dict[str, Any],
-             dry_run: bool, ledger: dict[str, int] | None = None) -> list[Path]:
+             dry_run: bool, ledger: dict[str, int] | None = None,
+             tiers: list[str] | tuple[str, ...] | None = None) -> list[Path]:
     _, _, _, _, _, archive, _ = parse_run_arguments(arguments)
     fsm = PromoteFSM()
     fsm.advance("init", "read")
@@ -329,7 +334,8 @@ def run_pass(precursor_path: Path, out_dir: Path, depot_dir: Path, branding: dic
     cleaned = strip_invisible_ink(bricks, set(raw_exceptions))
     fsm.advance("strip", "post")
     brand_ctx = extract_brand_context(branding, branding_path)
-    variants = build_variants(cleaned, out_dir, brand_ctx, taxonomy_rows, arguments, branding_path, ledger)
+    variants = build_variants(cleaned, out_dir, brand_ctx, taxonomy_rows, arguments,
+                              branding_path, ledger, tiers)
     depot_dst = depot_dir / precursor_path.name
     if archive and depot_dst.exists():
         raise FileExistsError(f"Refusing to overwrite archived precursor: {depot_dst}")
@@ -377,7 +383,8 @@ def run_batch(plan: PrefetchPlan, kuma_root: Path, branding: dict[str, Any],
         staged = stage_run_precursor(spec, dry_run=dry_run)
         run_ledger: dict[str, int] = {}
         run_pass(staged, out_dir, depot_dir, branding, branding_path,
-                 taxonomy_rows, spec.arguments, dry_run, run_ledger)
+                 taxonomy_rows, spec.arguments, dry_run, run_ledger,
+                 tiers=spec.arguments.get("tiers"))
 
 
 def main() -> None:
