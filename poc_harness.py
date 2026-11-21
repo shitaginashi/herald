@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import os
 import shutil
 import sqlite3
 import tempfile
@@ -10,8 +11,8 @@ import yaml
 
 from prefetch import PrefetchPlan, load_prefetch_plan, stage_run_precursor
 
-# Execution configuration is intentionally code-owned: the manifest is the batch
-# file (mode, ordered precursors, and per-run arguments), not a CLI interface.
+# The manifest is the batch file. Execution mode, run order, and run arguments
+# come from it; these paths and the manifest name are code-owned.
 HARNESS_DIR = Path(__file__).resolve().parent
 PREFETCH_MANIFEST = "prefetch_manifest.yml"
 KUMA_ROOT = Path("/media/ran/mu/kuma")
@@ -123,11 +124,9 @@ def extract_brand_context(branding: dict[str, Any], branding_path: Path) -> dict
         "domain": branding.get("domain") or identity.get("domain") or "ledante.com",
         "motto": identity.get("motto"),
         "pillars": _as_list(identity.get("brand_pillars") or branding.get("pillars")),
-        "voice": {
-            "primary": voice.get("primary_tone"), "secondary": voice.get("secondary_tone"),
-            "tertiary": voice.get("tertiary_tone", voice.get("tertiry_tone")),
-            "avoid": _as_list(voice.get("avoid")),
-        },
+        "voice": {"primary": voice.get("primary_tone"), "secondary": voice.get("secondary_tone"),
+                  "tertiary": voice.get("tertiary_tone", voice.get("tertiry_tone")),
+                  "avoid": _as_list(voice.get("avoid"))},
         "hashtags": {key: _as_list(hashtags.get(key)) for key in ("primary", "secondary", "boilerplate")},
         "keywords": {"core": _as_list(seo.get("core_keywords")), "long_tail": _as_list(seo.get("long_tail_keywords"))},
         "cta_youtube": ctas.get("youtube"), "cta_social": ctas.get("social_media"),
@@ -138,9 +137,11 @@ def extract_brand_context(branding: dict[str, Any], branding_path: Path) -> dict
 
 
 def parse_run_arguments(arguments: dict[str, Any]) -> tuple[list[str], dict[str, int], dict[str, str], str, list[str], bool]:
-    unknown = set(arguments) - SUPPORTED_ARGUMENTS
-    if unknown:
-        raise ValueError(f"Unsupported run argument(s): {', '.join(sorted(unknown))}")
+    if not isinstance(arguments, dict):
+        raise ValueError("Each run's arguments must be a mapping")
+    # Preserve extensibility: the full mapping is forwarded and included in each
+    # output. This runner interprets known keys but does not reject additional
+    # Kuma-owned options.
     tiers = arguments.get("tiers")
     if (not isinstance(tiers, list) or not tiers
             or any(not isinstance(tier, str) or tier not in ("atomic", "fancy") for tier in tiers)):
@@ -153,23 +154,25 @@ def parse_run_arguments(arguments: dict[str, Any]) -> tuple[list[str], dict[str,
         if not isinstance(value, int) or isinstance(value, bool) or value < 0:
             raise ValueError(f"Run must provide a non-negative integer {tier}_budget")
         budgets[tier] = value
-    routing = arguments.get("cta_routing")
+    routing = arguments.get("cta_routing", {})
     if not isinstance(routing, dict):
-        raise ValueError("Each run must provide cta_routing as a mapping")
-    if set(routing) - set(tiers):
-        raise ValueError("cta_routing may only specify tiers included in tiers")
+        raise ValueError("cta_routing must be a mapping")
+    # Routing may specify a broader tier set than this run's tier scope. Validate
+    # all entries, but only apply a route to tiers actually selected for the run.
     for tier, route in routing.items():
+        if tier not in ("atomic", "fancy"):
+            raise ValueError(f"Unsupported CTA routing tier: {tier!r}")
         if route not in ("social_media", "youtube"):
             raise ValueError(f"Unsupported CTA route for {tier}: {route!r}")
     policy = arguments.get("quota_policy")
     if policy != "populate_annotate_export_log_only":
         raise ValueError(f"Unsupported quota_policy: {policy!r}")
-    precedence = arguments.get("precedence")
+    precedence = arguments.get("precedence", [])
     if not isinstance(precedence, list) or any(not isinstance(item, str) for item in precedence):
-        raise ValueError("Each run must provide precedence as a list of strings")
-    archive = arguments.get("archive_to_depot")
+        raise ValueError("precedence must be a list of strings")
+    archive = arguments.get("archive_to_depot", False)
     if not isinstance(archive, bool):
-        raise ValueError("Each run must provide archive_to_depot as a boolean")
+        raise ValueError("archive_to_depot must be a boolean")
     return tiers, budgets, routing, policy, precedence, archive
 
 
@@ -220,6 +223,7 @@ def build_variants(clean: dict[str, Any], out_dir: Path, brand_ctx: dict[str, An
             "motif": motif, "target": target, "tier": tier, "body": body,
             "brand_ref": {"name": brand_ctx["name"], "domain": brand_ctx["domain"], "ssot_source": str(branding_path)},
             "brand_context": projected_context, "quota": quota,
+            "run_arguments": arguments,
             "taxonomy_ref": {"db_present": bool(taxonomy_rows), "tool_count": len(taxonomy_rows)},
             "precedence": {"configured_order": precedence, "wenwu_present": bool(wenwu),
                            "wenwu_enabled": bool(wenwu.get("enabled", False)), "mianzi_tool_ids": tool_ids},
@@ -274,7 +278,7 @@ def run_pass(precursor_path: Path, out_dir: Path, depot_dir: Path, branding: dic
         try:
             for path, payload in variants:
                 fd, temp_name = tempfile.mkstemp(prefix=f".{path.name}.", suffix=".tmp", dir=out_dir)
-                with open(fd, "w", encoding="utf-8", closefd=True) as handle:
+                with os.fdopen(fd, "w", encoding="utf-8") as handle:
                     json.dump(payload, handle, indent=2)
                     handle.write("\n")
                 temp_files.append((Path(temp_name), path))
@@ -301,8 +305,8 @@ def run_batch(plan: PrefetchPlan, kuma_root: Path, branding: dict[str, Any],
         raise ValueError("global_state.dry_run must be a boolean")
     out_dir = kuma_root / "out_poc"
     depot_dir = kuma_root / "sa" / "depot"
-    # Manifest list order is execution order. Each run's arguments are validated
-    # before prefetch can move that run's precursor.
+    # Manifest list order is execution order. Each run's complete argument map
+    # is passed to the handler; mode and paths have no CLI override.
     for spec in plan.runs:
         parse_run_arguments(spec.arguments)
         staged = stage_run_precursor(spec, dry_run=dry_run)
