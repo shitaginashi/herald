@@ -30,7 +30,7 @@ class PromoteFSM:
 
     def advance(self, expected_from: str, target: str) -> str:
         if self.state != expected_from:
-            raise RuntimeError(f"FSM transition error: expected {expected_from!r}, got {self.state!r}")
+            raise RuntimeError(f"FSM transition_error: expected {expected_from!r}, got {self.state!r}")
         self.state = target
         return self.state
 
@@ -91,10 +91,10 @@ def build_bricks(raw: dict[str, Any]) -> dict[str, Any]:
     bricks: dict[str, Any] = {}
     if "milestone" in raw:
         bricks["legacy_milestone"] = raw["milestone"]
-    for key in ("id", "schema", "base", "motif", "target", "body", "body_slots", "media", "link"):
+    for key in ("id", "schema", "base", "motif", "target", "body", "body_slots", "media", "link", "closer"):
         if key in raw and raw[key] is not None:
             bricks[key] = raw[key]
-    for key in ("control", "tags", "closer", "wenwu"):
+    for key in ("control", "tags", "wenwu"):
         value = raw.get(key)
         if value is not None and value != [] and value != {}:
             bricks[key] = value
@@ -110,7 +110,6 @@ def _as_list(value: Any) -> list[str]:
 
 
 def extract_brand_context(branding: dict[str, Any], branding_path: Path) -> dict[str, Any]:
-    """Normalize current branding.yml plus prior nested schema variants."""
     identity = branding.get("brand_identity") if isinstance(branding.get("brand_identity"), dict) else {}
     voice = identity.get("brand_voice_attributes")
     if not isinstance(voice, dict):
@@ -124,7 +123,7 @@ def extract_brand_context(branding: dict[str, Any], branding_path: Path) -> dict
         ctas = branding.get("calls_to_action") if isinstance(branding.get("calls_to_action"), dict) else {}
     tech = branding.get("technical_specifications") if isinstance(branding.get("technical_specifications"), dict) else {}
     return {
-        "name": branding.get("brand_name") or identity.get("name") or branding.get("name") or "Darker Side of Passion",
+        "name": branding.get("brand_name") or identity.get("name") or "Darker Side of Passion",
         "domain": branding.get("domain") or identity.get("domain") or "ledante.com",
         "motto": identity.get("motto") or branding.get("motto"),
         "pillars": _as_list(identity.get("brand_pillars") or branding.get("pillars")),
@@ -209,7 +208,6 @@ def _eligible_body_slots(source_slots: Any, tier: str) -> list[dict[str, Any]]:
 
 
 def _slot_content_chars(slots: list[dict[str, Any]]) -> int:
-    """Count content-bearing text/credit/link fields in eligible bricks."""
     count = 0
     for slot in slots:
         for key in ("value", "text", "credit", "url"):
@@ -224,7 +222,7 @@ def _slot_content_chars(slots: list[dict[str, Any]]) -> int:
 def apply_quota_budget(body: str, body_slots: list[dict[str, Any]], footer: dict[str, Any],
                        tier: str, budget_limit: int, quota_policy: str,
                        ledger: dict[str, int], extra_content: list[str] | None = None) -> dict[str, Any]:
-    """Record quota telemetry; downstream agent owns caps and any pruning."""
+    """Record quota telemetry; editing and pruning remain downstream."""
     if quota_policy != DEFAULT_QUOTA_POLICY:
         raise ValueError(f"Unsupported quota_policy: {quota_policy!r}")
     body_chars = len(body)
@@ -236,23 +234,28 @@ def apply_quota_budget(body: str, body_slots: list[dict[str, Any]], footer: dict
     ledger["posts_emitted_count"] = ledger.get("posts_emitted_count", 0) + 1
     ledger["cumulative_counted_chars"] = ledger.get("cumulative_counted_chars", 0) + counted_chars
     ledger["cumulative_overage_chars"] = ledger.get("cumulative_overage_chars", 0) + item_overage
-    errata = []
-    if counted_chars > budget_limit:
-        errata.extend(["ERR_ITEM_BUDGET_EXCEEDED", "ERR_ITEM_QUOTA_EXCEEDED_LOGGED"])
+    errata = ["ERR_ITEM_BUDGET_EXCEEDED", "ERR_ITEM_QUOTA_EXCEEDED_LOGGED"] if counted_chars > budget_limit else []
     return {
-        "policy": quota_policy, "budget_limit": budget_limit, "body_chars": body_chars,
-        "body_slot_chars": slot_chars, "footer_chars": footer_chars,
-        "extra_content_chars": extra_chars, "counted_chars": counted_chars,
+        "policy": quota_policy,
+        "counting_basis": "body + eligible slots + footer + included media/link text",
+        "budget_limit": budget_limit,
+        "body_chars": body_chars,
+        "body_slot_chars": slot_chars,
+        "footer_chars": footer_chars,
+        "extra_content_chars": extra_chars,
+        "counted_chars": counted_chars,
         "projected_total_chars": counted_chars,
         "remaining_headroom": budget_limit - counted_chars,
-        "exceeded": counted_chars > budget_limit, "overage_chars": item_overage,
-        "pruned": [], "errata": errata,
+        "exceeded": counted_chars > budget_limit,
+        "overage_chars": item_overage,
+        "pruned": [],
+        "errata": errata,
         "post_index": ledger["posts_emitted_count"],
         "posts_emitted_count": ledger["posts_emitted_count"],
         "cumulative_counted_chars": ledger["cumulative_counted_chars"],
         "cumulative_overage_chars": ledger["cumulative_overage_chars"],
-        "enforcement_owner": "downstream_agent",
-        "agent_directive": "Use quota and any configured caps to guide editing; harness records telemetry only and must not prune content.",
+        "enforcement_owner": "downstream_editor",
+        "editor_directive": "Revise as needed using quota telemetry; do not silently prune or change route without recording it.",
     }
 
 
@@ -260,12 +263,10 @@ def build_variants(clean: dict[str, Any], out_dir: Path, brand_ctx: dict[str, An
                    taxonomy_rows: list[dict[str, Any]], arguments: dict[str, Any],
                    branding_path: Path, ledger: dict[str, int] | None = None,
                    tiers: list[str] | tuple[str, ...] | None = None) -> list[tuple[Path, dict[str, Any]]]:
-    # The optional override lets callers pass the manifest's tier selection
-    # explicitly; omitted tiers continue to be read from run arguments.
     run_arguments = dict(arguments)
     if tiers is not None:
         run_arguments["tiers"] = list(tiers)
-    tiers, budgets, routing, policy, precedence, _, cta_enabled = parse_run_arguments(run_arguments)
+    selected_tiers, budgets, routing, policy, precedence, _, cta_enabled = parse_run_arguments(run_arguments)
     ledger = ledger if ledger is not None else {}
     base_id, motif, target = clean.get("id", "item"), clean.get("motif", "unknown"), clean.get("target", "base")
     body = clean.get("body", "")
@@ -276,7 +277,7 @@ def build_variants(clean: dict[str, Any], out_dir: Path, brand_ctx: dict[str, An
     tool_ids = [row["id"] for row in taxonomy_rows if "id" in row]
     footer = _footer(brand_ctx)
     results = []
-    for tier in tiers:
+    for tier in selected_tiers:
         slots = _eligible_body_slots(source_slots, tier)
         route = routing.get(tier)
         cta_key = {"social_media": "cta_social", "youtube": "cta_youtube"}.get(route)
@@ -305,6 +306,15 @@ def build_variants(clean: dict[str, Any], out_dir: Path, brand_ctx: dict[str, An
             "precedence": {"configured_order": precedence, "wenwu_present": bool(wenwu),
                            "wenwu_enabled": bool(wenwu.get("enabled", False)), "mianzi_tool_ids": tool_ids},
             "gates": {"allow_template_to_publish": False, "web_sense_eligible": False},
+            "handoff": {
+                "protocol": "yaml_succession",
+                "input_artifact": "chamber.yml",
+                "current_stage": "assemble",
+                "next_stage": "edit" if precedence and "edit" in precedence else None,
+                "next_stage_status": "ready_for_editor",
+                "revised_artifact_suffix": "_revised.yml",
+                "downstream_contract": "Preserve provenance and emit an explicit success or failure status.",
+            },
             "poc": {"edit_phase_skipped": True,
                     "illustrated_tier_status": "deferred_pending_fsr" if tier == "fancy" else "not_applicable",
                     "legacy_milestone": clean.get("legacy_milestone"),
