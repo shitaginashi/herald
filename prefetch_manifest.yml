@@ -1,8 +1,6 @@
 version: 1
 manifest_id: "kuma_poc_sweep"
 
-# This file is the batch plan: enabled runs execute in list order. dry_run is
-# the sole mode switch; there are no CLI overrides.
 global_state:
   dry_run: true
   expect_empty_sa: true
@@ -22,6 +20,7 @@ runs:
       tiers: ["atomic", "fancy"]
       atomic_budget: 280
       fancy_budget: 1000
+      cta_enabled: true
       cta_routing:
         atomic: "social_media"
         fancy: "youtube"
@@ -37,6 +36,7 @@ runs:
       tiers: ["atomic", "fancy"]
       atomic_budget: 280
       fancy_budget: 1000
+      cta_enabled: true
       cta_routing:
         atomic: "social_media"
         fancy: "youtube"

@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import json
-import os
 import shutil
 import sqlite3
 import tempfile
@@ -11,17 +10,13 @@ import yaml
 
 from prefetch import PrefetchPlan, load_prefetch_plan, stage_run_precursor
 
-# The manifest is the batch file. Execution mode, run order, and run arguments
-# come from it; these paths and the manifest name are code-owned.
+# The manifest is the batch file. Mode and ordered run arguments come from it;
+# filesystem locations and manifest name are code-owned.
 HARNESS_DIR = Path(__file__).resolve().parent
 PREFETCH_MANIFEST = "prefetch_manifest.yml"
 KUMA_ROOT = Path("/media/ran/mu/kuma")
 DEFAULT_BRANDING_PATH = Path("/media/ran/mu/notebook_runtime/src/notebooks/000/branding.yml")
 DEFAULT_TAXONOMY_DB_PATH = KUMA_ROOT / "data" / "taxonomy.db"
-SUPPORTED_ARGUMENTS = {
-    "tiers", "atomic_budget", "fancy_budget", "cta_routing",
-    "quota_policy", "precedence", "archive_to_depot",
-}
 
 
 class PromoteFSM:
@@ -64,8 +59,7 @@ def load_taxonomy_readonly(path: Path) -> list[dict[str, Any]]:
         print(f"[WARN] taxonomy DB not found at {path}; continuing without taxonomy rows.")
         return []
     try:
-        uri = f"file:{path.resolve()}?mode=ro"
-        with sqlite3.connect(uri, uri=True) as conn:
+        with sqlite3.connect(f"file:{path.resolve()}?mode=ro", uri=True) as conn:
             conn.row_factory = sqlite3.Row
             rows = conn.execute(
                 """SELECT t.id, t.name, t.tier_id, t.category_id, t.mianzi_weight, t.credit_uri
@@ -94,7 +88,7 @@ def build_bricks(raw: dict[str, Any]) -> dict[str, Any]:
     bricks: dict[str, Any] = {}
     if "milestone" in raw:
         bricks["legacy_milestone"] = raw["milestone"]
-    for key in ("id", "schema", "base", "motif", "target", "body", "media", "link"):
+    for key in ("id", "schema", "base", "motif", "target", "body", "body_slots", "media", "link"):
         if key in raw and raw[key] is not None:
             bricks[key] = raw[key]
     for key in ("control", "tags", "closer", "wenwu"):
@@ -113,22 +107,30 @@ def _as_list(value: Any) -> list[str]:
 
 
 def extract_brand_context(branding: dict[str, Any], branding_path: Path) -> dict[str, Any]:
+    """Normalize current branding.yml plus prior nested schema variants."""
     identity = branding.get("brand_identity") if isinstance(branding.get("brand_identity"), dict) else {}
-    voice = identity.get("brand_voice_attributes") if isinstance(identity.get("brand_voice_attributes"), dict) else {}
+    voice = identity.get("brand_voice_attributes")
+    if not isinstance(voice, dict):
+        voice = branding.get("voice_attributes") if isinstance(branding.get("voice_attributes"), dict) else {}
     seo = branding.get("seo_and_platform_guidelines") if isinstance(branding.get("seo_and_platform_guidelines"), dict) else {}
     hashtags = seo.get("hashtags") if isinstance(seo.get("hashtags"), dict) else {}
     ctas = seo.get("calls_to_action") if isinstance(seo.get("calls_to_action"), dict) else {}
     tech = branding.get("technical_specifications") if isinstance(branding.get("technical_specifications"), dict) else {}
     return {
-        "name": branding.get("brand_name") or identity.get("name") or "Darker Side of Passion",
+        "name": branding.get("brand_name") or identity.get("name") or branding.get("name") or "Darker Side of Passion",
         "domain": branding.get("domain") or identity.get("domain") or "ledante.com",
-        "motto": identity.get("motto"),
+        "motto": identity.get("motto") or branding.get("motto"),
         "pillars": _as_list(identity.get("brand_pillars") or branding.get("pillars")),
-        "voice": {"primary": voice.get("primary_tone"), "secondary": voice.get("secondary_tone"),
-                  "tertiary": voice.get("tertiary_tone", voice.get("tertiry_tone")),
-                  "avoid": _as_list(voice.get("avoid"))},
+        "voice": {
+            "primary": voice.get("primary_tone"), "secondary": voice.get("secondary_tone"),
+            "tertiary": voice.get("tertiary_tone", voice.get("tertiry_tone")),
+            "avoid": _as_list(voice.get("avoid")),
+        },
         "hashtags": {key: _as_list(hashtags.get(key)) for key in ("primary", "secondary", "boilerplate")},
-        "keywords": {"core": _as_list(seo.get("core_keywords")), "long_tail": _as_list(seo.get("long_tail_keywords"))},
+        "keywords": {
+            "core": _as_list(seo.get("core_keywords")),
+            "long_tail": _as_list(seo.get("long_tail_keywords") or branding.get("long_tail_keywords")),
+        },
         "cta_youtube": ctas.get("youtube"), "cta_social": ctas.get("social_media"),
         "tech": {"resolution": tech.get("resolution"), "frame_rate": tech.get("frame_rate"),
                  "software": _as_list(tech.get("software"))},
@@ -136,12 +138,9 @@ def extract_brand_context(branding: dict[str, Any], branding_path: Path) -> dict
     }
 
 
-def parse_run_arguments(arguments: dict[str, Any]) -> tuple[list[str], dict[str, int], dict[str, str], str, list[str], bool]:
+def parse_run_arguments(arguments: dict[str, Any]) -> tuple[list[str], dict[str, int], dict[str, str], str, list[str], bool, bool]:
     if not isinstance(arguments, dict):
         raise ValueError("Each run's arguments must be a mapping")
-    # Preserve extensibility: the full mapping is forwarded and included in each
-    # output. This runner interprets known keys but does not reject additional
-    # Kuma-owned options.
     tiers = arguments.get("tiers")
     if (not isinstance(tiers, list) or not tiers
             or any(not isinstance(tier, str) or tier not in ("atomic", "fancy") for tier in tiers)):
@@ -157,13 +156,12 @@ def parse_run_arguments(arguments: dict[str, Any]) -> tuple[list[str], dict[str,
     routing = arguments.get("cta_routing", {})
     if not isinstance(routing, dict):
         raise ValueError("cta_routing must be a mapping")
-    # Routing may specify a broader tier set than this run's tier scope. Validate
-    # all entries, but only apply a route to tiers actually selected for the run.
     for tier, route in routing.items():
-        if tier not in ("atomic", "fancy"):
-            raise ValueError(f"Unsupported CTA routing tier: {tier!r}")
-        if route not in ("social_media", "youtube"):
-            raise ValueError(f"Unsupported CTA route for {tier}: {route!r}")
+        if tier not in ("atomic", "fancy") or route not in ("social_media", "youtube"):
+            raise ValueError(f"Invalid CTA route {tier!r}: {route!r}")
+    cta_enabled = arguments.get("cta_enabled", False)
+    if not isinstance(cta_enabled, bool):
+        raise ValueError("cta_enabled must be a boolean")
     policy = arguments.get("quota_policy")
     if policy != "populate_annotate_export_log_only":
         raise ValueError(f"Unsupported quota_policy: {policy!r}")
@@ -173,57 +171,90 @@ def parse_run_arguments(arguments: dict[str, Any]) -> tuple[list[str], dict[str,
     archive = arguments.get("archive_to_depot", False)
     if not isinstance(archive, bool):
         raise ValueError("archive_to_depot must be a boolean")
-    return tiers, budgets, routing, policy, precedence, archive
+    # Unknown arguments are intentionally retained/forwarded for Kuma-owned
+    # extensions; this launcher only interprets the options it needs.
+    return tiers, budgets, routing, policy, precedence, archive, cta_enabled
 
 
-def apply_quota_budget(body: str, brand_ctx: dict[str, Any], tier: str,
-                       budget_limit: int, quota_policy: str) -> tuple[dict[str, Any], dict[str, Any]]:
+def _footer(brand_ctx: dict[str, Any]) -> dict[str, Any]:
+    groups = brand_ctx["hashtags"]
+    tags = groups["primary"] + groups["secondary"] + groups["boilerplate"]
+    return {"tags": tags, "text": " ".join(tags), "source": "branding.yml"}
+
+
+def _eligible_body_slots(source_slots: Any, tier: str) -> list[dict[str, Any]]:
+    if source_slots is None:
+        return []
+    if not isinstance(source_slots, list):
+        raise ValueError("precursor body_slots must be a list")
+    selected = []
+    for index, slot in enumerate(source_slots):
+        if not isinstance(slot, dict) or not isinstance(slot.get("slot"), str):
+            raise ValueError(f"body_slots[{index}] must be a mapping with a slot name")
+        slot_tiers = slot.get("tiers", ["atomic", "fancy"])
+        if isinstance(slot_tiers, str):
+            slot_tiers = [slot_tiers]
+        if not isinstance(slot_tiers, list) or any(t not in ("atomic", "fancy") for t in slot_tiers):
+            raise ValueError(f"body_slots[{index}].tiers must contain tier names")
+        if tier in slot_tiers:
+            selected.append(dict(slot))
+    return selected
+
+
+def apply_quota_budget(body: str, body_slots: list[dict[str, Any]], footer: dict[str, Any],
+                       tier: str, budget_limit: int, quota_policy: str) -> dict[str, Any]:
+    if quota_policy != "populate_annotate_export_log_only":
+        raise ValueError(f"Unsupported quota_policy: {quota_policy!r}")
     body_chars = len(body)
-    remaining = budget_limit - body_chars
-    footer_parts = []
-    if brand_ctx.get("cta_selected"):
-        footer_parts.append(str(brand_ctx["cta_selected"]))
-    tags = brand_ctx["hashtags"]["boilerplate"] + brand_ctx["hashtags"]["primary"] + brand_ctx["hashtags"]["secondary"]
-    if tags:
-        footer_parts.append(" ".join(tags))
-    footer_chars = len("\n".join(footer_parts))
-    projected = body_chars + footer_chars
+    slot_chars = sum(len(str(slot.get("value", ""))) for slot in body_slots)
+    footer_text = footer["text"]
+    footer_chars = len(footer_text)
+    # Telemetry estimates the assembled caption while keeping the source body,
+    # editable content bricks, and mandatory footer as separate output fields.
+    projected = body_chars + slot_chars + footer_chars
     errata = []
-    if remaining < 0:
-        errata.append("ERR_BODY_EXCEEDS_BUDGET")
     if projected > budget_limit:
-        errata.append("ERR_QUOTA_EXCEEDED_LOGGED")
-    context = {"cta": brand_ctx.get("cta_selected"), "hashtags": brand_ctx["hashtags"],
-               "keywords": brand_ctx["keywords"], "voice_avoid": brand_ctx["voice"]["avoid"]}
-    quota = {"policy": quota_policy, "budget_limit": budget_limit, "body_chars": body_chars,
-             "footer_chars": footer_chars, "projected_total_chars": projected,
-             "remaining_headroom": remaining, "exceeded": projected > budget_limit,
-             "overage_chars": max(0, projected - budget_limit), "pruned": [], "errata": errata}
-    return context, quota
+        errata.extend(["ERR_BODY_EXCEEDS_BUDGET", "ERR_QUOTA_EXCEEDED_LOGGED"])
+    return {
+        "policy": quota_policy, "budget_limit": budget_limit, "body_chars": body_chars,
+        "body_slot_chars": slot_chars, "footer_chars": footer_chars,
+        "projected_total_chars": projected,
+        "remaining_headroom": budget_limit - projected, "exceeded": projected > budget_limit,
+        "overage_chars": max(0, projected - budget_limit), "pruned": [], "errata": errata,
+    }
 
 
 def build_variants(clean: dict[str, Any], out_dir: Path, brand_ctx: dict[str, Any],
                    taxonomy_rows: list[dict[str, Any]], arguments: dict[str, Any],
                    branding_path: Path) -> list[tuple[Path, dict[str, Any]]]:
-    tiers, budgets, routing, policy, precedence, _ = parse_run_arguments(arguments)
+    tiers, budgets, routing, policy, precedence, _, cta_enabled = parse_run_arguments(arguments)
     base_id, motif, target = clean.get("id", "item"), clean.get("motif", "unknown"), clean.get("target", "base")
     body = clean.get("body", "")
     if not isinstance(body, str):
         raise ValueError("precursor body must be a string")
+    source_slots = clean.get("body_slots", [])
     wenwu = clean.get("wenwu") if isinstance(clean.get("wenwu"), dict) else {}
     tool_ids = [row["id"] for row in taxonomy_rows if "id" in row]
+    footer = _footer(brand_ctx)  # Tags are mandatory and always present as a footer brick.
     results = []
     for tier in tiers:
+        slots = _eligible_body_slots(source_slots, tier)
         route = routing.get(tier)
-        selected_cta = brand_ctx.get(f"cta_{route}") if route else None
-        tier_ctx = {**brand_ctx, "cta_selected": selected_cta}
-        projected_context, quota = apply_quota_budget(body, tier_ctx, tier, budgets[tier], policy)
+        cta_text = brand_ctx.get(f"cta_{route}") if cta_enabled and route else None
+        if cta_text:
+            slots.append({"slot": "CTA", "value": str(cta_text), "tiers": [tier], "source": f"branding.calls_to_action.{route}"})
+        quota = apply_quota_budget(body, slots, footer, tier, budgets[tier], policy)
         payload: dict[str, Any] = {
             "id": f"{base_id}_{tier}", "surface": clean.get("base", "reddit"), "stage": "reddit.json",
             "motif": motif, "target": target, "tier": tier, "body": body,
+            "body_slots": slots, "footer": footer,
             "brand_ref": {"name": brand_ctx["name"], "domain": brand_ctx["domain"], "ssot_source": str(branding_path)},
-            "brand_context": projected_context, "quota": quota,
-            "run_arguments": arguments,
+            "brand_context": {
+                "voice": brand_ctx["voice"], "hashtags": brand_ctx["hashtags"],
+                "keywords": brand_ctx["keywords"], "cta_enabled": cta_enabled,
+                "cta_route": route, "cta": cta_text,
+            },
+            "quota": quota, "run_arguments": arguments,
             "taxonomy_ref": {"db_present": bool(taxonomy_rows), "tool_count": len(taxonomy_rows)},
             "precedence": {"configured_order": precedence, "wenwu_present": bool(wenwu),
                            "wenwu_enabled": bool(wenwu.get("enabled", False)), "mianzi_tool_ids": tool_ids},
@@ -247,7 +278,7 @@ def build_variants(clean: dict[str, Any], out_dir: Path, brand_ctx: dict[str, An
 def run_pass(precursor_path: Path, out_dir: Path, depot_dir: Path, branding: dict[str, Any],
              branding_path: Path, taxonomy_rows: list[dict[str, Any]], arguments: dict[str, Any],
              dry_run: bool) -> list[Path]:
-    _, _, _, _, _, archive = parse_run_arguments(arguments)
+    _, _, _, _, _, archive, _ = parse_run_arguments(arguments)
     fsm = PromoteFSM()
     fsm.advance("init", "read")
     data = yaml.safe_load(precursor_path.read_text(encoding="utf-8"))
@@ -278,7 +309,7 @@ def run_pass(precursor_path: Path, out_dir: Path, depot_dir: Path, branding: dic
         try:
             for path, payload in variants:
                 fd, temp_name = tempfile.mkstemp(prefix=f".{path.name}.", suffix=".tmp", dir=out_dir)
-                with os.fdopen(fd, "w", encoding="utf-8") as handle:
+                with open(fd, "w", encoding="utf-8", closefd=True) as handle:
                     json.dump(payload, handle, indent=2)
                     handle.write("\n")
                 temp_files.append((Path(temp_name), path))
@@ -305,13 +336,10 @@ def run_batch(plan: PrefetchPlan, kuma_root: Path, branding: dict[str, Any],
         raise ValueError("global_state.dry_run must be a boolean")
     out_dir = kuma_root / "out_poc"
     depot_dir = kuma_root / "sa" / "depot"
-    # Manifest list order is execution order. Each run's complete argument map
-    # is passed to the handler; mode and paths have no CLI override.
     for spec in plan.runs:
         parse_run_arguments(spec.arguments)
         staged = stage_run_precursor(spec, dry_run=dry_run)
-        run_pass(staged, out_dir, depot_dir, branding, branding_path,
-                 taxonomy_rows, spec.arguments, dry_run)
+        run_pass(staged, out_dir, depot_dir, branding, branding_path, taxonomy_rows, spec.arguments, dry_run)
 
 
 def main() -> None:
