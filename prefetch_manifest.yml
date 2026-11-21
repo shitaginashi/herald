@@ -1,10 +1,12 @@
 version: 1
 manifest_id: "kuma_poc_sweep"
 
+# This file is the batch plan: enabled runs execute in list order. dry_run is
+# the sole mode switch; there are no CLI overrides.
 global_state:
   dry_run: true
   expect_empty_sa: true
-  default_export_dir: "bank"          # kuma exports to bank/ by default
+  default_export_dir: "bank"
   branding_ssot: "/media/ran/mu/notebook_runtime/src/notebooks/000/branding.yml"
   taxonomy_db: "/media/ran/mu/kuma/data/taxonomy.db"
   gates:
@@ -15,7 +17,7 @@ runs:
   - name: "yuggoth_chamber_stress"
     enabled: true
     precursor: "precursor_yuggoth.yml"
-    source_dir: "bank"                # prefetch stages bank/ -> sa/ when live
+    source_dir: "bank"
     arguments:
       tiers: ["atomic", "fancy"]
       atomic_budget: 280
