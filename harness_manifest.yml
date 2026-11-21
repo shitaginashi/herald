@@ -1,0 +1,28 @@
+version: 1
+manifest_id: "kuma_poc_sweep"
+
+global_state:
+  dry_run: true
+  expect_empty_sa: true
+  default_export_dir: "bank"          # kuma exports to bank/ by default
+  branding_ssot: "/media/ran/mu/notebook_runtime/src/notebooks/000/branding.yml"
+  taxonomy_db: "/media/ran/mu/kuma/data/taxonomy.db"
+  gates:
+    allow_template_to_publish: false
+    web_sense_eligible: false
+
+runs:
+  - name: "yuggoth_chamber_stress"
+    enabled: true
+    precursor: "precursor_yuggoth.yml"
+    source_dir: "bank"                # prefetch stages bank/ -> sa/ when live
+    arguments:
+      tiers: ["atomic", "fancy"]
+      atomic_budget: 280
+      fancy_budget: 1000
+      cta_routing:
+        atomic: "social_media"
+        fancy: "youtube"
+      quota_policy: "populate_annotate_export_log_only"
+      precedence: ["edit", "fsr", "wenwu", "mianzi"]
+      archive_to_depot: true

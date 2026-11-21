@@ -18,11 +18,6 @@ pub mod publish;
 pub use adapter::Adapter;
 pub use asset::Asset;
 pub use error::HeraldError;
-pub use id::{
-    AssetId,
-    MetricsSnapshotId,
-    PostId,
-    PublishRequestId,
-};
+pub use id::{AssetId, MetricsSnapshotId, PostId, PublishRequestId};
 pub use metrics::MetricsSnapshot;
 pub use publish::{PublishRequest, PublishResult};
